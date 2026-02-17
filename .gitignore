@@ -5,7 +5,9 @@ data/
 # Outputs
 outputs/
 *.png
-*.txt
+report.txt
+outputs/*.txt
+
 
 # Python cache
 __pycache__/

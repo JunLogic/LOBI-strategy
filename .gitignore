@@ -1,0 +1,20 @@
+# Data
+data/
+*.csv
+
+# Outputs
+outputs/
+*.png
+*.txt
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Virtual environments
+.venv/
+env/
+
+# VSCode
+.vscode/
+*.code-workspace

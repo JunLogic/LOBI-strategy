@@ -20,3 +20,7 @@ env/
 # VSCode
 .vscode/
 *.code-workspace
+
+data/binance/
+
+data/processed/

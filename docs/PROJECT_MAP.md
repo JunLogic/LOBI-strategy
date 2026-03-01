@@ -6,75 +6,67 @@
 LOBI-Backtest/
   data/
     binance/spot/              # raw Binance dumps (csv/zip by symbol/date)
-    processed/                 # merged parquet + engineered features
+    processed/                 # merged parquet + engineered datasets
   docs/
     PROJECT_MAP.md
-  outputs/                     # experiment reports/plots
-  rugrisk/                     # hazard/risk modeling scaffolding
+    MBARS_PLAN.md
+  mbars/                       # momentum-bars module scaffold (new)
+    __init__.py
+    config.py
+    bars.py
+    backtest.py
+  outputs/                     # experiment reports, model outputs, plots
+  rugrisk/                     # hazard/risk modeling code (unchanged)
   scripts/
     __init__.py
     download_binance.py
     merge_binance_spot.py
     build_features_1m.py
-  src/                         # FI-2010 backtest prototype pipeline
+    build_labels_drawdown.py
+    build_dataset_zscore_1m.py
+    train_hazard_logistic.py
+    infer_hazard.py
+    plot_hazard_diagnostics.py
+  src/                         # FI-2010 prototype code
   tests/
     test_build_features_smoke.py
+    test_build_labels_smoke.py
+    test_zscore_causality.py
   pytest.ini
   requirements.txt
 ```
 
 ## Data Flow
 
-1. Raw Binance files (`data/binance/spot/...`) are downloaded as CSV/ZIP.
-2. `scripts/merge_binance_spot.py` normalizes and merges into processed parquet:
-   - `data/processed/<SYMBOL>_klines_1m.parquet`
-   - `data/processed/<SYMBOL>_trades.parquet`
-3. `scripts/build_features_1m.py` builds per-minute feature parquet:
-   - `data/processed/<SYMBOL>_features_1m.parquet`
-   - `data/processed/<SYMBOL>_features_1m.meta.json`
-4. Labels + hazard model are the next stage (not implemented yet in a dedicated training script).
+1. Download raw Binance spot data:
+   - `scripts/download_binance.py`
+2. Merge and normalize to parquet:
+   - `scripts/merge_binance_spot.py`
+   - outputs:
+     - `data/processed/<SYMBOL>_klines_1m.parquet`
+     - `data/processed/<SYMBOL>_trades.parquet`
+3. Build 1-minute features:
+   - `scripts/build_features_1m.py`
+   - output: `data/processed/<SYMBOL>_features_1m.parquet`
+4. Build drawdown labels and dataset:
+   - `scripts/build_labels_drawdown.py`
+   - output: `data/processed/<SYMBOL>_dataset_1m.parquet`
+5. Optional causal z-scored dataset:
+   - `scripts/build_dataset_zscore_1m.py`
+   - output: `data/processed/<SYMBOL>_dataset_1m_z.parquet`
+6. Train hazard logistic model:
+   - `scripts/train_hazard_logistic.py`
+   - output under `outputs/hazard/<SYMBOL>/<LABEL>/`
+7. Run out-of-sample inference:
+   - `scripts/infer_hazard.py`
+8. Diagnostics plots:
+   - `scripts/plot_hazard_diagnostics.py`
+9. Planned next stage (`mbars/`):
+   - build 5s/10s bars
+   - join hazard gate (1m -> short bars forward fill)
+   - run hazard-gated momentum backtest
 
-## Key Scripts
+## Notes
 
-- `scripts/download_binance.py`
-  - Fetches Binance spot data archives.
-- `scripts/merge_binance_spot.py`
-  - Reads raw CSV/ZIP, normalizes schema, writes merged klines/trades parquet.
-- `scripts/build_features_1m.py`
-  - Uses kline grid + streaming trades aggregation (pyarrow dataset batches) to produce 1m causal features.
-- `src/run_experiment.py`
-  - Existing FI-2010 prototype runner (separate from Binance 1m feature pipeline).
-
-## How To Run
-
-Install deps:
-
-```powershell
-pip install -r requirements.txt
-```
-
-Merge Binance spot files to processed parquet:
-
-```powershell
-python scripts/merge_binance_spot.py
-```
-
-Build 1-minute features (example):
-
-```powershell
-python scripts/build_features_1m.py `
-  --symbol PEPEUSDT `
-  --klines_parquet data/processed/PEPEUSDT_klines_1m.parquet `
-  --trades_parquet data/processed/PEPEUSDT_trades.parquet `
-  --out_parquet data/processed/PEPEUSDT_features_1m.parquet `
-  --start_date 2024-10-01 `
-  --end_date 2025-06-30
-```
-
-Run tests from repo root:
-
-```powershell
-pytest -q
-```
-
-`pytest.ini` sets `pythonpath = .`, and `scripts/__init__.py` keeps `scripts` importable in tests.
+- Existing hazard logic stays under `rugrisk/` and current scripts.
+- `mbars/` is scaffolding only in this step; no trading logic moved yet.

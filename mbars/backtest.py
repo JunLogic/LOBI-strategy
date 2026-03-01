@@ -13,7 +13,7 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.dataset as ds
 
-from .config import MBarsConfig
+from .config import MBarsConfig, RiskConfig
 from .position_sizing import PositionContext, PositionSizingConfig, compute_position_size
 
 ROLLING_BARS = 6
@@ -26,6 +26,21 @@ class _OpenShortPosition:
     entry_time_ms: int
     entry_price: float
     size: float
+
+
+@dataclass
+class _RiskState:
+    trading_enabled: bool
+    risk_stop_trading_triggered: bool
+    risk_stop_time_ms: Optional[int]
+    kill_switch_triggers: int
+    entries_skipped_max_pos: int
+    entries_skipped_notional: int
+    entries_scaled_notional: int
+    forced_exits_max_hold: int
+    cooldown_total_bars: int
+    cooldown_remaining_bars: int
+    rebound_low: Optional[float]
 
 
 def _fmt_float(value: Optional[float]) -> str:
@@ -62,6 +77,10 @@ def _unrealized_pnl(open_positions: list[_OpenShortPosition], price: float) -> f
     return sum((pos.entry_price - price) * pos.size for pos in open_positions)
 
 
+def _total_notional(open_positions: list[_OpenShortPosition], price: float) -> float:
+    return sum(abs(pos.size) * price for pos in open_positions)
+
+
 def _close_position(
     *,
     position: _OpenShortPosition,
@@ -91,6 +110,28 @@ def _close_position(
     return pnl, int(bars_held)
 
 
+def _apply_close_result(
+    *,
+    pnl: float,
+    bars_held: int,
+    cash_equity: float,
+    total_pnl: float,
+    total_bars_held: int,
+    trade_count: int,
+    win_count: int,
+    loss_count: int,
+) -> tuple[float, float, int, int, int, int]:
+    cash_equity += pnl
+    total_pnl += pnl
+    total_bars_held += bars_held
+    trade_count += 1
+    if pnl > 0:
+        win_count += 1
+    elif pnl < 0:
+        loss_count += 1
+    return cash_equity, total_pnl, total_bars_held, trade_count, win_count, loss_count
+
+
 def run_momentum_backtest(
     symbol: str,
     bars_path: Path,
@@ -101,6 +142,7 @@ def run_momentum_backtest(
     takeprofit_pct: Optional[float],
     initial_equity: float,
     sizing_config: PositionSizingConfig,
+    risk_config: RiskConfig,
     log_every: int = 100_000,
 ) -> dict[str, Any]:
     if not symbol:
@@ -113,6 +155,20 @@ def run_momentum_backtest(
         raise ValueError("takeprofit_pct must be positive when provided.")
     if log_every <= 0:
         raise ValueError("log_every must be positive.")
+    if risk_config.max_open_positions <= 0:
+        raise ValueError("risk_config.max_open_positions must be positive.")
+    if risk_config.max_notional_frac < 0:
+        raise ValueError("risk_config.max_notional_frac must be non-negative.")
+    if risk_config.min_position_size < 0:
+        raise ValueError("risk_config.min_position_size must be non-negative.")
+    if risk_config.max_hold_bars <= 0:
+        raise ValueError("risk_config.max_hold_bars must be positive.")
+    if not (0.0 <= risk_config.equity_floor_frac <= 1.0):
+        raise ValueError("risk_config.equity_floor_frac must be in [0, 1].")
+    if risk_config.rebound_kill_pct < 0:
+        raise ValueError("risk_config.rebound_kill_pct must be non-negative.")
+    if risk_config.cooldown_bars < 0:
+        raise ValueError("risk_config.cooldown_bars must be non-negative.")
 
     bars_path = Path(bars_path)
     out_dir = Path(out_dir)
@@ -155,6 +211,12 @@ def run_momentum_backtest(
         f"stoploss_pct={stoploss_pct} takeprofit_pct={takeprofit_pct} initial_equity={initial_equity} "
         f"sizing_mode={sizing_config.mode}"
     )
+    print(
+        f"[bt] risk max_open_positions={risk_config.max_open_positions} "
+        f"max_notional_frac={risk_config.max_notional_frac} min_position_size={risk_config.min_position_size} "
+        f"max_hold_bars={risk_config.max_hold_bars} equity_floor_frac={risk_config.equity_floor_frac} "
+        f"rebound_kill_pct={risk_config.rebound_kill_pct} cooldown_bars={risk_config.cooldown_bars}"
+    )
     print(f"[bt] run_dir={run_dir}")
 
     start_ts = time.perf_counter()
@@ -182,6 +244,20 @@ def run_momentum_backtest(
 
     last_time_ms: Optional[int] = None
     last_price: Optional[float] = None
+    equity_floor_value = initial_equity * risk_config.equity_floor_frac
+    risk_state = _RiskState(
+        trading_enabled=True,
+        risk_stop_trading_triggered=False,
+        risk_stop_time_ms=None,
+        kill_switch_triggers=0,
+        entries_skipped_max_pos=0,
+        entries_skipped_notional=0,
+        entries_scaled_notional=0,
+        forced_exits_max_hold=0,
+        cooldown_total_bars=0,
+        cooldown_remaining_bars=0,
+        rebound_low=None,
+    )
 
     with trades_path.open("w", newline="", encoding="utf-8") as trades_fp, equity_path.open(
         "w", newline="", encoding="utf-8"
@@ -262,10 +338,57 @@ def run_momentum_backtest(
                 rolling_ready = len(rolling_returns) == ROLLING_BARS
                 rolling_return = rolling_sum if rolling_ready else 0.0
 
-                trading_active = _is_finite(hazard_prob) and (hazard_prob > hazard_threshold)
+                hazard_active = _is_finite(hazard_prob) and (hazard_prob > hazard_threshold)
+                if hazard_active or open_positions:
+                    if risk_state.rebound_low is None:
+                        risk_state.rebound_low = price
+                    elif price < risk_state.rebound_low:
+                        risk_state.rebound_low = price
+                else:
+                    risk_state.rebound_low = None
+
+                if (
+                    risk_state.rebound_low is not None
+                    and risk_state.rebound_low > 0.0
+                    and risk_config.rebound_kill_pct > 0.0
+                    and price >= (risk_state.rebound_low * (1.0 + risk_config.rebound_kill_pct))
+                ):
+                    if open_positions:
+                        for pos in open_positions:
+                            pnl, bars_held = _close_position(
+                                position=pos,
+                                exit_time_ms=bar_time_ms,
+                                exit_price=price,
+                                exit_reason="rebound_kill_switch",
+                                trades_writer=trades_writer,
+                            )
+                            (
+                                cash_equity,
+                                total_pnl,
+                                total_bars_held,
+                                trade_count,
+                                win_count,
+                                loss_count,
+                            ) = _apply_close_result(
+                                pnl=pnl,
+                                bars_held=bars_held,
+                                cash_equity=cash_equity,
+                                total_pnl=total_pnl,
+                                total_bars_held=total_bars_held,
+                                trade_count=trade_count,
+                                win_count=win_count,
+                                loss_count=loss_count,
+                            )
+                        open_positions = []
+                    risk_state.kill_switch_triggers += 1
+                    risk_state.cooldown_remaining_bars = max(
+                        risk_state.cooldown_remaining_bars, risk_config.cooldown_bars
+                    )
+                    risk_state.rebound_low = price
+
+                trading_active = hazard_active and risk_state.trading_enabled
 
                 if not trading_active and open_positions:
-                    still_open: list[_OpenShortPosition] = []
                     for pos in open_positions:
                         pnl, bars_held = _close_position(
                             position=pos,
@@ -274,15 +397,24 @@ def run_momentum_backtest(
                             exit_reason="hazard_off",
                             trades_writer=trades_writer,
                         )
-                        cash_equity += pnl
-                        total_pnl += pnl
-                        total_bars_held += bars_held
-                        trade_count += 1
-                        if pnl > 0:
-                            win_count += 1
-                        elif pnl < 0:
-                            loss_count += 1
-                    open_positions = still_open
+                        (
+                            cash_equity,
+                            total_pnl,
+                            total_bars_held,
+                            trade_count,
+                            win_count,
+                            loss_count,
+                        ) = _apply_close_result(
+                            pnl=pnl,
+                            bars_held=bars_held,
+                            cash_equity=cash_equity,
+                            total_pnl=total_pnl,
+                            total_bars_held=total_bars_held,
+                            trade_count=trade_count,
+                            win_count=win_count,
+                            loss_count=loss_count,
+                        )
+                    open_positions = []
 
                 if trading_active and open_positions:
                     survivors: list[_OpenShortPosition] = []
@@ -290,13 +422,41 @@ def run_momentum_backtest(
                     takeprofit_mult = 1.0 - takeprofit_pct if takeprofit_pct is not None else None
 
                     for pos in open_positions:
+                        bars_held_now = max(0, (bar_time_ms - pos.entry_time_ms) // 5_000)
+                        max_hold_hit = bars_held_now >= risk_config.max_hold_bars
                         stop_hit = price > (pos.entry_price * stoploss_mult)
                         tp_hit = (
                             takeprofit_mult is not None
                             and price < (pos.entry_price * takeprofit_mult)
                         )
 
-                        if stop_hit:
+                        if max_hold_hit:
+                            pnl, bars_held = _close_position(
+                                position=pos,
+                                exit_time_ms=bar_time_ms,
+                                exit_price=price,
+                                exit_reason="max_hold",
+                                trades_writer=trades_writer,
+                            )
+                            risk_state.forced_exits_max_hold += 1
+                            (
+                                cash_equity,
+                                total_pnl,
+                                total_bars_held,
+                                trade_count,
+                                win_count,
+                                loss_count,
+                            ) = _apply_close_result(
+                                pnl=pnl,
+                                bars_held=bars_held,
+                                cash_equity=cash_equity,
+                                total_pnl=total_pnl,
+                                total_bars_held=total_bars_held,
+                                trade_count=trade_count,
+                                win_count=win_count,
+                                loss_count=loss_count,
+                            )
+                        elif stop_hit:
                             pnl, bars_held = _close_position(
                                 position=pos,
                                 exit_time_ms=bar_time_ms,
@@ -304,14 +464,23 @@ def run_momentum_backtest(
                                 exit_reason="stoploss",
                                 trades_writer=trades_writer,
                             )
-                            cash_equity += pnl
-                            total_pnl += pnl
-                            total_bars_held += bars_held
-                            trade_count += 1
-                            if pnl > 0:
-                                win_count += 1
-                            elif pnl < 0:
-                                loss_count += 1
+                            (
+                                cash_equity,
+                                total_pnl,
+                                total_bars_held,
+                                trade_count,
+                                win_count,
+                                loss_count,
+                            ) = _apply_close_result(
+                                pnl=pnl,
+                                bars_held=bars_held,
+                                cash_equity=cash_equity,
+                                total_pnl=total_pnl,
+                                total_bars_held=total_bars_held,
+                                trade_count=trade_count,
+                                win_count=win_count,
+                                loss_count=loss_count,
+                            )
                         elif tp_hit:
                             pnl, bars_held = _close_position(
                                 position=pos,
@@ -320,40 +489,123 @@ def run_momentum_backtest(
                                 exit_reason="takeprofit",
                                 trades_writer=trades_writer,
                             )
-                            cash_equity += pnl
-                            total_pnl += pnl
-                            total_bars_held += bars_held
-                            trade_count += 1
-                            if pnl > 0:
-                                win_count += 1
-                            elif pnl < 0:
-                                loss_count += 1
+                            (
+                                cash_equity,
+                                total_pnl,
+                                total_bars_held,
+                                trade_count,
+                                win_count,
+                                loss_count,
+                            ) = _apply_close_result(
+                                pnl=pnl,
+                                bars_held=bars_held,
+                                cash_equity=cash_equity,
+                                total_pnl=total_pnl,
+                                total_bars_held=total_bars_held,
+                                trade_count=trade_count,
+                                win_count=win_count,
+                                loss_count=loss_count,
+                            )
                         else:
                             survivors.append(pos)
                     open_positions = survivors
 
-                if trading_active and rolling_ready and (rolling_return < downside_return_threshold):
-                    mtm_equity = cash_equity + _unrealized_pnl(open_positions, price)
-                    context = PositionContext(
-                        equity=mtm_equity,
-                        price=price,
-                        open_positions=len(open_positions),
-                        hazard_prob=hazard_prob,
-                    )
-                    size = compute_position_size(context, sizing_config)
-                    if _is_finite(size) and size > 0.0:
-                        position_id += 1
-                        opened_positions += 1
-                        open_positions.append(
-                            _OpenShortPosition(
-                                position_id=position_id,
-                                entry_time_ms=bar_time_ms,
-                                entry_price=price,
-                                size=float(size),
+                mtm_equity = cash_equity + _unrealized_pnl(open_positions, price)
+                if mtm_equity <= equity_floor_value and risk_state.trading_enabled:
+                    if open_positions:
+                        for pos in open_positions:
+                            pnl, bars_held = _close_position(
+                                position=pos,
+                                exit_time_ms=bar_time_ms,
+                                exit_price=price,
+                                exit_reason="equity_floor",
+                                trades_writer=trades_writer,
                             )
+                            (
+                                cash_equity,
+                                total_pnl,
+                                total_bars_held,
+                                trade_count,
+                                win_count,
+                                loss_count,
+                            ) = _apply_close_result(
+                                pnl=pnl,
+                                bars_held=bars_held,
+                                cash_equity=cash_equity,
+                                total_pnl=total_pnl,
+                                total_bars_held=total_bars_held,
+                                trade_count=trade_count,
+                                win_count=win_count,
+                                loss_count=loss_count,
+                            )
+                        open_positions = []
+                    risk_state.trading_enabled = False
+                    risk_state.risk_stop_trading_triggered = True
+                    risk_state.risk_stop_time_ms = bar_time_ms
+                    mtm_equity = cash_equity
+
+                entries_allowed = (
+                    trading_active
+                    and risk_state.cooldown_remaining_bars == 0
+                    and rolling_ready
+                    and (rolling_return < downside_return_threshold)
+                    and risk_state.trading_enabled
+                )
+                if entries_allowed:
+                    if len(open_positions) >= risk_config.max_open_positions:
+                        risk_state.entries_skipped_max_pos += 1
+                    else:
+                        context = PositionContext(
+                            equity=mtm_equity,
+                            price=price,
+                            open_positions=len(open_positions),
+                            hazard_prob=hazard_prob,
                         )
+                        size = compute_position_size(context, sizing_config)
+                        if _is_finite(size) and size > 0.0:
+                            current_notional = _total_notional(open_positions, price)
+                            notional_cap = max(0.0, mtm_equity) * risk_config.max_notional_frac
+                            available_notional = notional_cap - current_notional
+                            proposed_notional = abs(size) * price
+                            final_size = size
+
+                            if proposed_notional > available_notional:
+                                if available_notional > 0.0:
+                                    scaled_size = available_notional / price
+                                    if scaled_size >= risk_config.min_position_size:
+                                        final_size = scaled_size
+                                        risk_state.entries_scaled_notional += 1
+                                    else:
+                                        risk_state.entries_skipped_notional += 1
+                                        final_size = 0.0
+                                else:
+                                    risk_state.entries_skipped_notional += 1
+                                    final_size = 0.0
+                            elif size < risk_config.min_position_size:
+                                risk_state.entries_skipped_notional += 1
+                                final_size = 0.0
+
+                            if _is_finite(final_size) and final_size > 0.0:
+                                position_id += 1
+                                opened_positions += 1
+                                open_positions.append(
+                                    _OpenShortPosition(
+                                        position_id=position_id,
+                                        entry_time_ms=bar_time_ms,
+                                        entry_price=price,
+                                        size=float(final_size),
+                                    )
+                                )
 
                 mtm_equity = cash_equity + _unrealized_pnl(open_positions, price)
+                if mtm_equity < 0.0:
+                    mtm_equity = 0.0
+                    cash_equity = max(cash_equity, 0.0)
+
+                if risk_state.cooldown_remaining_bars > 0:
+                    risk_state.cooldown_total_bars += 1
+                    risk_state.cooldown_remaining_bars -= 1
+
                 if mtm_equity > peak_equity:
                     peak_equity = mtm_equity
                 if peak_equity > 0.0:
@@ -393,15 +645,25 @@ def run_momentum_backtest(
                     exit_reason="end_of_data",
                     trades_writer=trades_writer,
                 )
-                cash_equity += pnl
-                total_pnl += pnl
-                total_bars_held += bars_held
-                trade_count += 1
-                if pnl > 0:
-                    win_count += 1
-                elif pnl < 0:
-                    loss_count += 1
+                (
+                    cash_equity,
+                    total_pnl,
+                    total_bars_held,
+                    trade_count,
+                    win_count,
+                    loss_count,
+                ) = _apply_close_result(
+                    pnl=pnl,
+                    bars_held=bars_held,
+                    cash_equity=cash_equity,
+                    total_pnl=total_pnl,
+                    total_bars_held=total_bars_held,
+                    trade_count=trade_count,
+                    win_count=win_count,
+                    loss_count=loss_count,
+                )
             open_positions = []
+            cash_equity = max(cash_equity, 0.0)
 
             if cash_equity > peak_equity:
                 peak_equity = cash_equity
@@ -423,6 +685,7 @@ def run_momentum_backtest(
             rows_written_equity += 1
 
     elapsed = time.perf_counter() - start_ts
+    cash_equity = max(cash_equity, 0.0)
     win_rate = (win_count / trade_count) if trade_count > 0 else 0.0
     avg_bars_held = (total_bars_held / trade_count) if trade_count > 0 else 0.0
 
@@ -444,6 +707,14 @@ def run_momentum_backtest(
         "final_equity": cash_equity,
         "max_drawdown": max_drawdown,
         "avg_bars_held": avg_bars_held,
+        "risk_stop_trading_triggered": risk_state.risk_stop_trading_triggered,
+        "risk_stop_time_ms": risk_state.risk_stop_time_ms,
+        "kill_switch_triggers": risk_state.kill_switch_triggers,
+        "entries_skipped_max_pos": risk_state.entries_skipped_max_pos,
+        "entries_skipped_notional": risk_state.entries_skipped_notional,
+        "entries_scaled_notional": risk_state.entries_scaled_notional,
+        "forced_exits_max_hold": risk_state.forced_exits_max_hold,
+        "cooldown_total_bars": risk_state.cooldown_total_bars,
         "elapsed_s": elapsed,
         "hazard_threshold": hazard_threshold,
         "downside_return_threshold": downside_return_threshold,
@@ -455,6 +726,15 @@ def run_momentum_backtest(
             "fixed_size": sizing_config.fixed_size,
             "equity_fraction": sizing_config.equity_fraction,
             "max_notional": sizing_config.max_notional,
+        },
+        "risk": {
+            "max_open_positions": risk_config.max_open_positions,
+            "max_notional_frac": risk_config.max_notional_frac,
+            "min_position_size": risk_config.min_position_size,
+            "max_hold_bars": risk_config.max_hold_bars,
+            "equity_floor_frac": risk_config.equity_floor_frac,
+            "rebound_kill_pct": risk_config.rebound_kill_pct,
+            "cooldown_bars": risk_config.cooldown_bars,
         },
         "files": {
             "trades_csv": str(trades_path),

@@ -9,6 +9,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from mbars.backtest import run_momentum_backtest
+from mbars.config import RiskConfig
 from mbars.position_sizing import PositionSizingConfig
 
 
@@ -49,6 +50,13 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--equity-fraction", type=float, default=0.02)
     parser.add_argument("--fixed-size", type=float, default=1.0)
     parser.add_argument("--max-notional", type=float, default=None)
+    parser.add_argument("--max-open-positions", type=int, default=3)
+    parser.add_argument("--max-notional-frac", type=float, default=0.10)
+    parser.add_argument("--min-position-size", type=float, default=0.0)
+    parser.add_argument("--max-hold-bars", type=int, default=720)
+    parser.add_argument("--equity-floor-frac", type=float, default=0.2)
+    parser.add_argument("--rebound-kill", type=float, default=0.02)
+    parser.add_argument("--cooldown-bars", type=int, default=120)
     parser.add_argument("--log-every", type=int, default=100000)
     return parser.parse_args()
 
@@ -65,6 +73,22 @@ def main() -> None:
         equity_fraction=args.equity_fraction,
         max_notional=args.max_notional,
     )
+    risk_config = RiskConfig(
+        max_open_positions=args.max_open_positions,
+        max_notional_frac=args.max_notional_frac,
+        min_position_size=args.min_position_size,
+        max_hold_bars=args.max_hold_bars,
+        equity_floor_frac=args.equity_floor_frac,
+        rebound_kill_pct=args.rebound_kill,
+        cooldown_bars=args.cooldown_bars,
+    )
+
+    print(
+        f"[bt] cli-risk max_open_positions={risk_config.max_open_positions} "
+        f"max_notional_frac={risk_config.max_notional_frac} min_position_size={risk_config.min_position_size} "
+        f"max_hold_bars={risk_config.max_hold_bars} equity_floor_frac={risk_config.equity_floor_frac} "
+        f"rebound_kill_pct={risk_config.rebound_kill_pct} cooldown_bars={risk_config.cooldown_bars}"
+    )
 
     summary = run_momentum_backtest(
         symbol=args.symbol,
@@ -76,6 +100,7 @@ def main() -> None:
         takeprofit_pct=args.takeprofit,
         initial_equity=args.initial_equity,
         sizing_config=sizing_config,
+        risk_config=risk_config,
         log_every=args.log_every,
     )
 

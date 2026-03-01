@@ -9,7 +9,7 @@ LOBI-Backtest is a deterministic research and backtesting stack for hazard-gated
 
 ### Architectural Separation
 - **Hazard model layer**: training/inference pipeline under hazard/risk workflows (`scripts/train_hazard_logistic.py`, `scripts/infer_hazard.py`, outputs under `outputs/hazard/...`).
-- **Momentum engine layer**: streaming bar construction, hazard join, backtest execution, diagnostics, and sweep orchestration under `mbars/` and `scripts/`.
+- **Momentum engine layer**: streaming bar construction, hazard join, backtest execution, diagnostics, and sweep orchestration under `mbars/`, `scripts/`, and `lobi_backtest/sweep/`.
 
 Hazard model code and momentum engine are intentionally decoupled. Momentum consumes hazard probabilities as an input signal only.
 
@@ -262,24 +262,25 @@ outputs/mbars/<SYMBOL>/<RUN_TAG>/
     trade_pnl_hist.png
 
 outputs/mbars/<SYMBOL>/sweeps/<SWEEP_ID>/
-  results.csv
-  results_top20.csv
+  provenance.json
   spec_used.yaml
+  results.parquet
+  results_top20.csv                    # optional derived convenience artifact
   progress.log
 ```
 
-### Run Tag Convention
-Backtest run tags encode parameters in deterministic text form, e.g.:
+### Run Tag Convention (Phase 6)
+Per-run directories keep deterministic, human-readable tags, for example:
 - `ht0p6_dtm0p003_sl0p008_tpnone_szequity_fraction_rb6`
 
-Components:
-- `ht` hazard threshold
-- `dt` downside threshold
-- `sl` stoploss
-- `tp` takeprofit (`none` if null)
-- `sz` sizing mode
-- `rb` rolling bars
-- optional risk delta suffixes may be appended in sweep-generated tags when risk differs from defaults
+Where:
+- `run_tag` remains readable and stable for identical parameter values.
+- `spec_hash = sha256(raw_spec_text)`
+- `run_config_hash = sha256(canonical_run_config_json)`
+- `run_tag_hash = sha256(canonical_run_config_json + "|" + dataset_id + "|" + code_id)[0:16]` (metadata only)
+- `canonical_run_config_json` is stable JSON with sorted keys and normalized float formatting.
+- `dataset_id` is fingerprint-or-metadata based and does not require full dataset scans.
+- `code_id` is `git rev-parse HEAD` or `"nogit"` fallback.
 
 ---
 
@@ -288,9 +289,41 @@ Components:
 - No random operations in single run backtests.
 - Streaming scan over parquet input with fixed logic.
 - No lookahead in hazard join or trading decisions.
-- Sweep runner deterministic by default (ordered Cartesian product).
-- Optional sweep shuffle is deterministic when seed is fixed.
-- Sweep resume behavior: existing `summary.json` => run skipped.
+- Sweep runner uses deterministic ordered Cartesian product in the exact grid key order from YAML.
+- Sweep filters are applied post-expansion in deterministic iteration order.
+- Hash metadata (`run_config_hash`, `run_tag_hash`) is computed from canonicalized effective config + dataset_id + code_id.
+- Run directories use human-readable run_tag encoding, not hash-only tags.
+- Resume behavior is parquet-first: `status == "ok"` run_tags are skipped.
+- Results writes are append-by-rewrite with temp file + atomic rename.
+
+### Phase 6 Architecture (Deterministic Sweep Layer)
+- Canonical entry point: `python scripts\sweep_momentum.py --spec <path> ...`
+- Secondary/internal entry point: `python -m lobi_backtest.sweep.run --spec <path> ...`
+- Backward-compatible legacy spec (`symbols/base/grids`) remains supported.
+- Grid sweep expansion is deterministic; optional shuffle is deterministic with fixed seed.
+- Execution wrapper: calls existing `mbars.backtest.run_momentum_backtest(...)` without changing hazard module logic
+- Per-symbol sweep table: `outputs/mbars/<SYMBOL>/sweeps/<SWEEP_ID>/results.parquet`
+
+### Resume Semantics
+- Primary: scan historical `outputs/mbars/<SYMBOL>/sweeps/*/results.parquet` and skip run_tag when any row has `status == "ok"`.
+- Secondary fallback: if parquet is missing or unreadable/corrupted, skip run_tag when `outputs/mbars/<SYMBOL>/<RUN_TAG>/summary.json` exists.
+- Rows with `status == "error"` are rerun by default.
+- Optional behavior: `--skip-errors` skips previously errored run_tags as well.
+- `--force-rerun` bypasses resume skipping and reruns all planned runs.
+- `--max-runs` limits runs for the current invocation after resume filtering.
+
+### `results.parquet` Core Schema
+- Identity/provenance:
+  - `run_tag` (human-readable), `run_tag_hash`, `status`
+  - `code_id`, `dataset_id`, `spec_hash`, `run_config_hash`
+  - `started_utc`, `ended_utc`, `runtime_seconds`
+- Flattened parameter columns:
+  - `param_<flattened_path>` (e.g. `param_risk__max_open_positions`)
+- Headline metrics:
+  - `pnl_proxy_end`, `final_equity`, `max_drawdown`, `trades`, `win_rate`
+  - plus selected risk counters (`kill_switch_triggers`, `entries_skipped_*`, etc.)
+- Error context:
+  - `error` (null for success rows)
 
 ---
 
@@ -306,7 +339,8 @@ Components:
 
 ## 10. Roadmap (Next Phases)
 
-- **PHASE 6**: Large deterministic parameter sweep (implemented baseline orchestrator; can be expanded for scale).
+- **PHASE 6**: Large deterministic parameter sweep (implemented with parquet results, deterministic ordering, and resume).
+- **PHASE 6.1**: Canonicalized sweep CLI (`scripts/sweep_momentum.py`) integrated with new sweep core while preserving legacy output/run_tag conventions.
 - **PHASE 7**: Slippage + fee modeling.
 - **PHASE 8**: Cross-symbol portfolio allocator.
 - **PHASE 9**: Bridge into `LOBI-live-testnet`.
@@ -326,7 +360,7 @@ Deploy selected sweep-approved configuration into `LOBI-live-testnet` with stric
 - Same position sizing mode/formula.
 
 ### Integration Steps
-1. Select winning config from `results.csv`/`results_top20.csv`.
+1. Select winning config from `outputs/mbars/<SYMBOL>/sweeps/<SWEEP_ID>/results.parquet`.
 2. Freeze parameters into testnet strategy config.
 3. Port risk-state machine exactly (max-pos, exposure, max-hold, equity floor, rebound kill-switch, cooldown).
 4. Validate event-by-event parity against offline replay for a fixed period.
@@ -374,5 +408,6 @@ python scripts\sweep_momentum.py --spec docs\sweeps\mbars_sweep_spec.yaml --all-
 
 Smoke sweep example:
 ```powershell
-python scripts\sweep_momentum.py --spec docs\sweeps\mbars_sweep_spec.yaml --symbol FLOKIUSDT --max-runs 10
+python scripts\sweep_momentum.py --spec docs\sweeps\mbars_sweep_spec.yaml --symbol FLOKIUSDT --max-runs 10 --dry-run
+python scripts\sweep_momentum.py --spec docs\sweeps\mbars_sweep_spec.yaml --symbol FLOKIUSDT --force-rerun
 ```

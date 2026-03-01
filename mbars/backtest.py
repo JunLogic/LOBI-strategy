@@ -143,6 +143,8 @@ def run_momentum_backtest(
     initial_equity: float,
     sizing_config: PositionSizingConfig,
     risk_config: RiskConfig,
+    rolling_bars: int = ROLLING_BARS,
+    run_tag: Optional[str] = None,
     log_every: int = 100_000,
 ) -> dict[str, Any]:
     if not symbol:
@@ -155,6 +157,8 @@ def run_momentum_backtest(
         raise ValueError("takeprofit_pct must be positive when provided.")
     if log_every <= 0:
         raise ValueError("log_every must be positive.")
+    if rolling_bars <= 0:
+        raise ValueError("rolling_bars must be positive.")
     if risk_config.max_open_positions <= 0:
         raise ValueError("risk_config.max_open_positions must be positive.")
     if risk_config.max_notional_frac < 0:
@@ -176,14 +180,14 @@ def run_momentum_backtest(
     if not bars_path.exists():
         raise FileNotFoundError(f"Bars parquet not found: {bars_path}")
 
-    run_tag = _make_run_tag(
+    resolved_run_tag = run_tag if run_tag else _make_run_tag(
         hazard_threshold=hazard_threshold,
         downside_return_threshold=downside_return_threshold,
         stoploss_pct=stoploss_pct,
         takeprofit_pct=takeprofit_pct,
         sizing_mode=sizing_config.mode,
     )
-    run_dir = out_dir / symbol / run_tag
+    run_dir = out_dir / symbol / resolved_run_tag
     run_dir.mkdir(parents=True, exist_ok=True)
 
     trades_path = run_dir / "trades.csv"
@@ -209,7 +213,7 @@ def run_momentum_backtest(
     print(
         f"[bt] params hazard_threshold={hazard_threshold} downside_threshold={downside_return_threshold} "
         f"stoploss_pct={stoploss_pct} takeprofit_pct={takeprofit_pct} initial_equity={initial_equity} "
-        f"sizing_mode={sizing_config.mode}"
+        f"sizing_mode={sizing_config.mode} rolling_bars={rolling_bars}"
     )
     print(
         f"[bt] risk max_open_positions={risk_config.max_open_positions} "
@@ -239,7 +243,7 @@ def run_momentum_backtest(
     position_id = 0
     open_positions: list[_OpenShortPosition] = []
 
-    rolling_returns: deque[float] = deque(maxlen=ROLLING_BARS)
+    rolling_returns: deque[float] = deque(maxlen=rolling_bars)
     rolling_sum = 0.0
 
     last_time_ms: Optional[int] = None
@@ -330,12 +334,12 @@ def run_momentum_backtest(
                     else:
                         ret_5s = 0.0
 
-                if len(rolling_returns) == ROLLING_BARS:
+                if len(rolling_returns) == rolling_bars:
                     rolling_sum -= rolling_returns[0]
                 rolling_returns.append(ret_5s)
                 rolling_sum += ret_5s
 
-                rolling_ready = len(rolling_returns) == ROLLING_BARS
+                rolling_ready = len(rolling_returns) == rolling_bars
                 rolling_return = rolling_sum if rolling_ready else 0.0
 
                 hazard_active = _is_finite(hazard_prob) and (hazard_prob > hazard_threshold)
@@ -692,6 +696,7 @@ def run_momentum_backtest(
     summary: dict[str, Any] = {
         "symbol": symbol,
         "bars_path": str(bars_path),
+        "run_tag": resolved_run_tag,
         "run_dir": str(run_dir),
         "rows_scanned": rows_scanned,
         "rows_written_equity": rows_written_equity,
@@ -720,7 +725,7 @@ def run_momentum_backtest(
         "downside_return_threshold": downside_return_threshold,
         "stoploss_pct": stoploss_pct,
         "takeprofit_pct": takeprofit_pct,
-        "rolling_bars": ROLLING_BARS,
+        "rolling_bars": rolling_bars,
         "sizing": {
             "mode": sizing_config.mode,
             "fixed_size": sizing_config.fixed_size,

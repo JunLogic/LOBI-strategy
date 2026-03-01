@@ -1,0 +1,58 @@
+version: 1
+sweep_name: "floki_momentum_v1"
+
+dataset:
+  symbol: "FLOKIUSDT"
+  bars_root: "data/processed"
+  hazard_root: "outputs/hazard/FLOKIUSDT/y_dd_30p_H1440m"
+  start: "2024-01-01T00:00:00Z"
+  end: "2024-12-31T23:59:59Z"
+
+engine:
+  resume: true
+  fail_fast: false
+  write_plots: false
+  write_per_run_timeseries: false
+  max_runs: null
+
+hazard:
+  hazard_threshold: 0.65
+  join_mode: "minute_bucket"
+
+base_params:
+  momentum:
+    lookback_bars: 240
+    downside_trigger_bp: 60
+    entry_rebound_bp: 20
+    stoploss_pct: 0.008
+    takeprofit_pct: null
+  risk:
+    max_open_positions: 3
+    exposure_cap: 0.35
+    max_hold_bars: 720
+    equity_floor_frac: 0.70
+    rebound_kill: true
+    cooldown_bars: 120
+  sizing:
+    mode: "equity_fraction"
+    equity_fraction: 0.02
+    fixed_size: 1.0
+    max_notional: null
+  initial_equity: 100000.0
+
+sweep:
+  type: "grid"
+  grid:
+    momentum.lookback_bars: [120, 240, 360]
+    momentum.downside_trigger_bp: [40, 60, 80]
+    momentum.entry_rebound_bp: [10, 20, 30]
+    risk.max_open_positions: [2, 3]
+    risk.exposure_cap: [0.25, 0.35]
+  filters:
+    - "momentum.entry_rebound_bp < momentum.downside_trigger_bp"
+
+output:
+  root_dir: "runs"
+  results_table: "parquet"
+  save_spec_copy: true
+
